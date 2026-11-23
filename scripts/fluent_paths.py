@@ -20,8 +20,14 @@ from pathlib import Path
 
 
 def force_utf8_io() -> None:
-    """Make stdout/stderr UTF-8 so emoji/CJK output doesn't crash on Windows."""
-    for stream in (sys.stdout, sys.stderr):
+    """Make stdin/stdout/stderr UTF-8 so emoji/CJK doesn't crash on Windows.
+
+    Under an ASCII/C locale (e.g. Git Bash), stdin can be decoded with
+    surrogateescape, causing CJK bytes in a piped payload to fail at re-encode
+    time. No-op on platforms whose streams are already UTF-8 or predate
+    ``reconfigure``.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):

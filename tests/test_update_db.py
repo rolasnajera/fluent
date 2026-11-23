@@ -8,6 +8,7 @@ session report, and asserts schema invariants on the output files.
 Usage:
     python3 tests/test_update_db.py
 """
+import copy
 import json
 import os
 import shutil
@@ -155,7 +156,7 @@ class UpdateDbSmokeTest(unittest.TestCase):
 
     def _run(self, payload: dict):
         proc = subprocess.run(
-            ["python3", str(SCRIPT)],
+            [sys.executable, str(SCRIPT)],
             input=json.dumps(payload).encode(),
             cwd=str(self.tmp),
             capture_output=True,
@@ -221,6 +222,31 @@ class UpdateDbSmokeTest(unittest.TestCase):
         backup = self.tmp / "data" / ".backups" / "pre-update-session-002"
         self.assertTrue(backup.exists(), "pre-update backup missing")
 
+    def test_payload_from_argv(self):
+        """The payload may be passed as argv[1] instead of stdin (stdin is not
+        always connected, e.g. when run as a background task)."""
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), json.dumps(SESSION_PAYLOAD)],
+            stdin=subprocess.DEVNULL,
+            cwd=str(self.tmp),
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0,
+                         msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        with open(self.tmp / "data" / "session-log.json", encoding="utf-8") as f:
+            log = json.load(f)
+        self.assertEqual(log["sessions"][-1]["session_id"],
+                         SESSION_PAYLOAD["session_id"])
+
+    def test_invalid_argv_payload_exits_1(self):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "{not json"],
+            stdin=subprocess.DEVNULL,
+            cwd=str(self.tmp),
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+
     def test_missing_required_field_exits_1(self):
         proc = self._run({"date": "2026-04-24"})  # no session_id
         self.assertEqual(proc.returncode, 1)
@@ -232,7 +258,7 @@ class UpdateDbSmokeTest(unittest.TestCase):
         payload["date"] = "2026-04-23"
         proc = self._run(payload)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        with open(self.tmp / "data" / "learner-profile.json") as f:
+        with open(self.tmp / "data" / "learner-profile.json", encoding="utf-8") as f:
             profile = json.load(f)
         self.assertEqual(profile["current_streak_days"], 2)
 
@@ -246,7 +272,7 @@ class UpdateDbSmokeTest(unittest.TestCase):
         return payload
 
     def _load(self, name):
-        with open(self.tmp / "data" / name) as f:
+        with open(self.tmp / "data" / name, encoding="utf-8") as f:
             return json.load(f)
 
     def test_milestone_string_form(self):
@@ -348,6 +374,145 @@ class UpdateDbSmokeTest(unittest.TestCase):
         self.assertEqual(len(set(ids)), 2, msg=f"colliding ids: {ids}")
         for i in ids:
             self.assertFalse(i.endswith("_"), f"bare trailing underscore: {i}")
+
+    def test_cjk_payload_roundtrips_utf8(self):
+        # Regression: under an ASCII/C locale (Git Bash on Windows), stdin was
+        # decoded with surrogateescape and CJK payloads crashed at save time,
+        # after some databases were already written.
+        payload = dict(SESSION_PAYLOAD)
+        payload["session_id"] = "session-300"
+        payload["errors"] = [dict(SESSION_PAYLOAD["errors"][0],
+                                  your_answer="achieve = 実績",
+                                  correct_answer="achieve = 達成する（動詞）")]
+        proc = self._run(payload)
+        self.assertEqual(proc.returncode, 0,
+                         msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        with open(self.tmp / "data" / "mistakes-db.json", encoding="utf-8") as f:
+            mistakes = json.load(f)
+        example = mistakes["error_patterns"]["verb_spreek"]["examples"][-1]
+        self.assertEqual(example["incorrect"], "achieve = 実績")
+        self.assertEqual(example["correct"], "achieve = 達成する（動詞）")
+
+    def test_cjk_payload_survives_ascii_locale(self):
+        # Same as above but forcing the worst-case locale explicitly.
+        payload = dict(SESSION_PAYLOAD)
+        payload["session_id"] = "session-301"
+        payload["session_notes"] = "過去形と冠詞のリベンジ成功"
+        env = dict(os.environ, LC_ALL="C", LANG="C")
+        env.pop("PYTHONUTF8", None)
+        env.pop("PYTHONIOENCODING", None)
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input=json.dumps(payload).encode(),
+            cwd=str(self.tmp),
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0,
+                         msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        with open(self.tmp / "data" / "session-log.json", encoding="utf-8") as f:
+            log = json.load(f)
+        self.assertEqual(log["sessions"][-1]["notes"], "過去形と冠詞のリベンジ成功")
+
+    def test_rerun_same_session_id_preserves_first_backup(self):
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        first = self.tmp / "data" / ".backups" / "pre-update-session-002"
+        marker = json.loads((first / "learner-profile.json").read_text(encoding="utf-8"))
+
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        second = self.tmp / "data" / ".backups" / "pre-update-session-002-2"
+        self.assertTrue(second.exists(), "retry should get a numbered backup dir")
+        # First backup still holds the original pre-update state.
+        preserved = json.loads((first / "learner-profile.json").read_text(encoding="utf-8"))
+        self.assertEqual(preserved, marker)
+
+    def _snapshot(self):
+        return {f.name: f.read_bytes()
+                for f in sorted((self.tmp / "data").glob("*.json"))}
+
+    def test_same_session_id_replaces_instead_of_double_counting(self):
+        """Re-sending an identical payload must leave all six databases exactly
+        as they were after the first call (issue #19)."""
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        after_first = self._snapshot()
+
+        for _ in range(2):
+            proc = self._run(SESSION_PAYLOAD)
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn(b"Replaced", proc.stdout)
+        self.assertEqual(self._snapshot(), after_first)
+
+    def test_same_session_id_applies_corrected_payload(self):
+        """A corrected resubmission replaces the first record's content."""
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        with open(self.tmp / "data" / "learner-profile.json", encoding="utf-8") as f:
+            sessions_after_first = json.load(f)["total_sessions"]
+
+        corrected = copy.deepcopy(SESSION_PAYLOAD)
+        corrected["duration_minutes"] = SESSION_PAYLOAD.get("duration_minutes", 0) + 7
+        corrected["session_notes"] = "corrected"
+        proc = self._run(corrected)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        with open(self.tmp / "data" / "learner-profile.json", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["total_sessions"], sessions_after_first)
+        with open(self.tmp / "data" / "session-log.json", encoding="utf-8") as f:
+            log = json.load(f)
+        matching = [x for x in log["sessions"]
+                    if x["session_id"] == SESSION_PAYLOAD["session_id"]]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["duration_minutes"], corrected["duration_minutes"])
+        self.assertEqual(matching[0]["notes"], "corrected")
+
+    def test_replacing_an_older_session_exits_1_no_mutation(self):
+        """Only the most recent session can be replaced; rolling back an older
+        one would silently drop the sessions recorded after it."""
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        later = copy.deepcopy(SESSION_PAYLOAD)
+        later["session_id"] = "session-003"
+        proc = self._run(later)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        before = self._snapshot()
+
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"not the most recent", proc.stderr)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_replace_without_backup_exits_1_no_mutation(self):
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        shutil.rmtree(self.tmp / "data" / ".backups")
+        before = self._snapshot()
+
+        proc = self._run(SESSION_PAYLOAD)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"backup", proc.stderr)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_save_failure_leaves_all_databases_unchanged(self):
+        # Force a staging failure by making one destination's .tmp path a
+        # directory; the two-phase commit must abort before replacing any DB.
+        before = {name: (self.tmp / "data" / name).read_text(encoding="utf-8")
+                  for name in ("learner-profile.json", "progress-db.json",
+                               "mistakes-db.json", "mastery-db.json",
+                               "spaced-repetition.json", "session-log.json")}
+        blocker = self.tmp / "data" / "session-log.json.tmp"
+        blocker.mkdir()
+        try:
+            proc = self._run(SESSION_PAYLOAD)
+            self.assertEqual(proc.returncode, 2, msg=proc.stderr)
+            after = {name: (self.tmp / "data" / name).read_text(encoding="utf-8")
+                     for name in before}
+            self.assertEqual(after, before,
+                             "a failed save must not modify any database")
+        finally:
+            blocker.rmdir()
 
     def test_milestones_empty_and_omitted_are_noops(self):
         for n, payload in enumerate([

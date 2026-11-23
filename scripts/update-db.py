@@ -35,14 +35,31 @@ def load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def save_json(path: Path, data: dict):
-    tmp_path = path.with_suffix('.json.tmp')
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(str(tmp_path), str(path))  # atomic + overwrites (os.rename fails on Windows if dest exists)
+def save_all(files: dict, data: dict):
+    """Two-phase commit across every DB: stage each one to a .tmp file first,
+    then swap them all in. A serialization/encoding error during staging
+    aborts before a single real database is replaced, so exit 2 never leaves
+    the six files mutually inconsistent (e.g. profile updated but session-log
+    not)."""
+    staged = []
+    try:
+        for key, path in files.items():
+            tmp_path = path.with_suffix('.json.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data[key], f, indent=2, ensure_ascii=False)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            staged.append((tmp_path, path))
+    except Exception:
+        for path in files.values():
+            try:
+                path.with_suffix('.json.tmp').unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    for tmp_path, path in staged:
+        os.replace(str(tmp_path), str(path))  # atomic + overwrites (os.rename fails on Windows if dest exists)
 
 
 def parse_date(s: str) -> datetime:
@@ -136,11 +153,55 @@ def normalize_milestones(session: dict) -> list:
     return normalized
 
 
-def backup_all(tag: str):
+def backup_all(tag: str) -> Path:
+    # Never reuse an existing dir: re-running the same session_id (e.g. a
+    # retry after a failure) would otherwise overwrite the only backup taken
+    # before anything went wrong.
     backup_path = BACKUP_DIR / tag
-    backup_path.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while backup_path.exists():
+        n += 1
+        backup_path = BACKUP_DIR / f"{tag}-{n}"
+    backup_path.mkdir(parents=True)
     for f in DATA_DIR.glob("*.json"):
         shutil.copy2(f, backup_path / f.name)
+    return backup_path
+
+
+def load_pre_session_state(sid: str, logged_ids: list, files: dict) -> dict:
+    """Return the six databases as they were before session `sid` was first
+    applied, so re-sending the same session_id REPLACES the earlier record
+    instead of counting the session twice.
+
+    The state comes from the `pre-update-<sid>` backup, which backup_all()
+    writes before the first application and never overwrites. Replacing is only
+    safe for the most recent session: rolling back an older one would also
+    discard every session recorded after it. Raises ValueError (nothing is
+    written) when a safe replace is not possible.
+    """
+    if logged_ids[-1] != sid:
+        raise ValueError(
+            f"session {sid} is already recorded and is not the most recent session "
+            f"({logged_ids[-1]}), so it cannot be replaced. Use a new session_id.")
+    backup = BACKUP_DIR / f"pre-update-{sid}"
+    missing = [p.name for p in files.values() if not (backup / p.name).exists()]
+    if missing:
+        raise ValueError(
+            f"session {sid} is already recorded and its pre-update backup is "
+            f"missing or incomplete ({backup}), so it cannot be replaced. "
+            f"Use a new session_id.")
+    try:
+        state = {k: load_json(backup / p.name) for k, p in files.items()}
+    except (OSError, ValueError) as e:
+        raise ValueError(
+            f"session {sid} is already recorded and its pre-update backup could "
+            f"not be read ({e}), so it cannot be replaced. Use a new session_id.")
+    if any(x.get("session_id") == sid for x in state["log"].get("sessions", [])):
+        # A backup written by an older version that overwrote it on retry.
+        raise ValueError(
+            f"session {sid} is already recorded and its pre-update backup already "
+            f"contains it, so it cannot be replaced. Use a new session_id.")
+    return state
 
 
 # --- SM-2 Algorithm ---
@@ -531,7 +592,10 @@ def update_session_log(log: dict, session: dict, streak: int):
 
 def main():
     try:
-        session = json.load(sys.stdin)
+        if len(sys.argv) > 1:
+            session = json.loads(sys.argv[1])
+        else:
+            session = json.load(sys.stdin)
     except json.JSONDecodeError as e:
         print(f"[Fluent] Error: Invalid JSON input: {e}", file=sys.stderr)
         sys.exit(1)
@@ -562,6 +626,18 @@ def main():
         print(f"[Fluent] Error loading databases: {e}", file=sys.stderr)
         sys.exit(2)
 
+    # Same session_id again = replace the earlier record, not a second session.
+    # Start from the state saved before that session was first applied.
+    sid = session["session_id"]
+    logged_ids = [x.get("session_id") for x in originals["log"].get("sessions", [])]
+    replacing = sid in logged_ids
+    if replacing:
+        try:
+            originals = load_pre_session_state(sid, logged_ids, files)
+        except ValueError as e:
+            print(f"[Fluent] Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Work on deep copies so a mid-run exception leaves disk untouched.
     data = {k: copy.deepcopy(v) for k, v in originals.items()}
 
@@ -583,8 +659,7 @@ def main():
     backup_all(f"pre-update-{session['session_id']}")
 
     try:
-        for k, p in files.items():
-            save_json(p, data[k])
+        save_all(files, data)
     except Exception as e:
         print(f"[Fluent] Error saving databases: {e}", file=sys.stderr)
         sys.exit(2)
@@ -597,6 +672,8 @@ def main():
     total_cor = sum(s.get("correct", 0) for s in skill_scores.values())
 
     print(f"[Fluent] ✅ Updated 6 databases for session {session['session_id']}")
+    if replacing:
+        print(f"[Fluent] ♻️ Replaced the earlier record of session {session['session_id']} (not counted twice)")
     print(f"[Fluent] 🔥 Streak: {streak} days | Sessions: {stats['total_sessions']} | Minutes: {stats['total_study_minutes']}")
     if total_ex > 0:
         print(f"[Fluent] 📊 This session: {total_cor}/{total_ex} correct ({round(total_cor/total_ex*100)}%)")
