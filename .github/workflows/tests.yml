@@ -22,7 +22,9 @@ jobs:
         include:
           - { os: ubuntu-22.04, python: "3.8" }  # oldest supported version; newer images no longer ship it
           - { os: ubuntu-latest, python: "3.12" }
-          - { os: macos-latest, python: "3.12" }
+          # Disabled to avoid 5-10+ min GitHub Actions runner queue times; tests are run locally on macOS.
+          # Uncomment if macOS CI coverage is needed later.
+          # - { os: macos-latest, python: "3.12" }
           - { os: windows-latest, python: "3.12" }
     steps:
       - uses: actions/checkout@v5
