@@ -33,7 +33,7 @@ This project adheres to a code of conduct that all contributors are expected to 
 
 ### Prerequisites
 
-- [Claude Code](https://code.claude.com) installed
+- **Google Antigravity** (CLI or IDE) installed
 - Git for version control
 - Basic understanding of:
   - JSON data structures
@@ -55,9 +55,9 @@ This project adheres to a code of conduct that all contributors are expected to 
    ```
 
 3. **Test the system:**
+   Open the workspace in Google Antigravity and run `/fluent-setup`, or run the unit tests:
    ```bash
-   claude
-   /fluent-setup
+   python3 tests/test_update_db.py
    ```
 
 4. **Make your changes and test thoroughly**
@@ -75,7 +75,7 @@ Before creating bug reports, please check existing issues to avoid duplicates.
 - Exact steps to reproduce
 - Expected vs actual behavior
 - Screenshots if applicable
-- Your environment (OS, Claude Code version)
+- Your environment (OS, Antigravity version, Gemini model)
 - Error messages or logs
 
 **Use this template:**
@@ -96,7 +96,7 @@ If applicable, add screenshots.
 
 **Environment:**
 - OS: [e.g. macOS 14.0]
-- Claude Code Version: [e.g. 1.0.0]
+- Antigravity Version / Model: [e.g. Antigravity CLI, Gemini]
 - Target Language: [e.g. Spanish]
 ```
 
@@ -359,7 +359,6 @@ Contributors are recognized in several ways:
 - [SM-2 Algorithm](https://www.supermemo.com/en/archives1990-2015/english/ol/sm2)
 - [CEFR Levels](https://www.coe.int/en/web/common-european-framework-reference-languages/level-descriptions)
 - [Spaced Repetition Research](https://www.gwern.net/Spaced-repetition)
-- [Claude Code Docs](https://code.claude.com/docs)
 
 ### Project Resources
 
