@@ -1,0 +1,25 @@
+{
+  "fluent-session-start": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ../scripts/session-start.py",
+        "timeout": 10
+      }
+    ]
+  },
+  "fluent-data-validator": {
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ../scripts/validate-data.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

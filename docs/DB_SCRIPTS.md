@@ -1,6 +1,6 @@
 # Database Helper Scripts
 
-Two Python scripts under `.claude/hooks/` manage the six learner databases:
+Two Python scripts under `scripts/` manage the six learner databases:
 
 | Script | Purpose |
 |--------|---------|
@@ -8,15 +8,12 @@ Two Python scripts under `.claude/hooks/` manage the six learner databases:
 | `update-db.py` | Apply a session report to all 6 databases atomically |
 
 Both scripts resolve the data directory internally (see `fluent_paths.data_dir()`)
-and produce identical output regardless of CWD. Always invoke them with the
-`${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-.}}` prefix so the script path
-itself resolves whether Fluent is installed as a plugin (CWD is the data
-directory) or cloned (CWD is the repo root).
+and produce identical output regardless of CWD. Run them from the repository root:
 
 ## Reading
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/read-db.py"
+python3 scripts/read-db.py
 ```
 
 Outputs a single JSON object:
@@ -47,8 +44,12 @@ Exit codes: `0` OK, `1` one or more files missing (partial result with
 
 ## Writing
 
+The session report is read from stdin (preferred, shown below). If stdin is
+not available, for example when the script runs as a background task, pass the
+same JSON as the first argument instead: `update-db.py "$JSON_PAYLOAD"`.
+
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/update-db.py" <<'EOF'
+python3 scripts/update-db.py <<'EOF'
 {
   "session_id": "session-005",
   "date": "2026-04-24",
@@ -109,14 +110,23 @@ Everything else is optional; omitted fields do not update.
 ### Side effects
 - Backs up `data/*.json` to `.backups/pre-update-<session_id>/` *before*
   writing.
-- Writes each JSON file via a `.tmp` + `fsync` + `rename` pattern so a crash
-  mid-write cannot leave a half-written file.
+- Writes each JSON file via a two-phase commit: all six files are staged to
+  `.tmp` (with `fsync`) first, then all are swapped in via `rename`. A
+  serialization or encoding error therefore aborts before any real database
+  is touched — the six files never end up mutually inconsistent.
+- Re-sending a `session_id` that is already recorded **replaces** that record
+  rather than adding a second session: the update is applied on top of the
+  `pre-update-<session_id>` backup (the state before the session was first
+  applied), so totals, streaks and SM-2 state are not counted twice. Only the
+  most recent session can be replaced. If it is not the most recent one, or
+  its backup is missing, the script exits `1` and changes nothing.
 - Rebuilds `spaced-repetition.review_queue` from scratch each run — any manual
   edits there will be overwritten.
 
 ### Exit codes
 - `0` success
-- `1` validation error (bad/missing JSON, missing required field)
+- `1` validation error (bad/missing JSON, missing required field, or a
+  repeated `session_id` that cannot be replaced safely); no files were modified
 - `2` I/O or logic error (full traceback on stderr; no files were modified)
 
 ## Data model notes
